@@ -16,10 +16,86 @@ import (
 	"encoding/hex"
 	"fmt"
 	"os"
+	"sync"
 
 	"go.uber.org/zap"
 	"go.uber.org/zap/zapcore"
+	"gopkg.in/natefinch/lumberjack.v2"
 )
+
+var (
+	// Global logger instance
+	globalLogger *zap.Logger
+	globalMu     sync.RWMutex
+)
+
+func init() {
+	// Initialize with default logger
+	l, _ := New(Config{
+		Level:      "info",
+		Format:     "json",
+		OutputPath: "stdout",
+	})
+	globalLogger = l
+}
+
+// SetGlobalLogger sets the global logger instance
+func SetGlobalLogger(logger *zap.Logger) {
+	globalMu.Lock()
+	defer globalMu.Unlock()
+	globalLogger = logger
+}
+
+// GetGlobalLogger returns the global logger instance
+func GetGlobalLogger() *zap.Logger {
+	globalMu.RLock()
+	defer globalMu.RUnlock()
+	return globalLogger
+}
+
+// L returns the global logger (shorthand for GetGlobalLogger)
+func L() *zap.Logger {
+	return GetGlobalLogger()
+}
+
+// Debug logs a debug message using global logger
+func Debug(msg string, fields ...zap.Field) {
+	GetGlobalLogger().Debug(msg, fields...)
+}
+
+// Info logs an info message using global logger
+func Info(msg string, fields ...zap.Field) {
+	GetGlobalLogger().Info(msg, fields...)
+}
+
+// Warn logs a warning message using global logger
+func Warn(msg string, fields ...zap.Field) {
+	GetGlobalLogger().Warn(msg, fields...)
+}
+
+// Error logs an error message using global logger
+func Error(msg string, fields ...zap.Field) {
+	GetGlobalLogger().Error(msg, fields...)
+}
+
+// Fatal logs a fatal message using global logger and exits
+func Fatal(msg string, fields ...zap.Field) {
+	GetGlobalLogger().Fatal(msg, fields...)
+}
+
+// Sync flushes any buffered log entries (call before exit)
+func Sync() error {
+	return GetGlobalLogger().Sync()
+}
+
+// RotationConfig configures log file rotation
+type RotationConfig struct {
+	Filename   string // Full path to log file
+	MaxSize    int    // Maximum size in megabytes before rotation (default: 100MB)
+	MaxBackups int    // Maximum number of old log files to keep (default: 3)
+	MaxAge     int    // Maximum days to keep old log files (default: 30)
+	Compress   bool   // Compress old log files (default: true)
+}
 
 type Config struct {
 	Level      string // "debug", "info", "warn", "error", "fatal"
@@ -32,6 +108,10 @@ type Config struct {
 	Version     string // Application version (e.g., "v1.0.0", git commit hash)
 	Host        string // Hostname or instance identifier
 	PID         int    // Process ID (0 = auto-detect)
+
+	// Advanced options
+	Rotation       *RotationConfig // Enable log rotation (nil = disabled)
+	AdditionalOuts []string        // Additional output paths (e.g., ["stdout", "/var/log/app.log"])
 }
 
 func New(cfg Config) (*zap.Logger, error) {
@@ -44,17 +124,42 @@ func New(cfg Config) (*zap.Logger, error) {
 	// 2. Setup encoder (format output)
 	encoder := getEncoder(cfg.Format)
 
-	// 3. Setup output writer
-	writer, err := getWriter(cfg.OutputPath)
-	if err != nil {
-		return nil, err
+	// 3. Setup output writer(s)
+	var writers []zapcore.WriteSyncer
+
+	// Primary output
+	if cfg.OutputPath != "" {
+		writer, err := getWriter(cfg.OutputPath, cfg.Rotation)
+		if err != nil {
+			return nil, err
+		}
+		writers = append(writers, writer)
+	}
+
+	// Additional outputs
+	if len(cfg.AdditionalOuts) > 0 {
+		for _, path := range cfg.AdditionalOuts {
+			writer, err := getWriter(path, nil) // rotation only for primary
+			if err != nil {
+				return nil, fmt.Errorf("failed to setup additional output %s: %w", path, err)
+			}
+			writers = append(writers, writer)
+		}
+	}
+
+	// Combine all writers
+	var finalWriter zapcore.WriteSyncer
+	if len(writers) == 1 {
+		finalWriter = writers[0]
+	} else {
+		finalWriter = zapcore.NewMultiWriteSyncer(writers...)
 	}
 
 	// 4. Build core logger
 	core := zapcore.NewCore(
-		encoder, // How to encode (JSON/Console)
-		writer,  // Where to write (stdout/file)
-		level,   // Minimum level to log
+		encoder,     // How to encode (JSON/Console)
+		finalWriter, // Where to write (stdout/file)
+		level,       // Minimum level to log
 	)
 
 	// 5. Create logger with options
@@ -147,14 +252,26 @@ func getEncoder(format string) zapcore.Encoder {
 	return zapcore.NewJSONEncoder(encoderConfig)
 }
 
-func getWriter(outputPath string) (zapcore.WriteSyncer, error) {
+func getWriter(outputPath string, rotation *RotationConfig) (zapcore.WriteSyncer, error) {
 	switch outputPath {
 	case "stdout", "":
 		return zapcore.AddSync(os.Stdout), nil
 	case "stderr":
 		return zapcore.AddSync(os.Stderr), nil
 	default:
-		// File output
+		// File output with optional rotation
+		if rotation != nil {
+			// Use lumberjack for log rotation
+			return zapcore.AddSync(&lumberjack.Logger{
+				Filename:   rotation.Filename,
+				MaxSize:    getOrDefault(rotation.MaxSize, 100),  // 100MB default
+				MaxBackups: getOrDefault(rotation.MaxBackups, 3), // keep 3 backups
+				MaxAge:     getOrDefault(rotation.MaxAge, 30),    // 30 days
+				Compress:   rotation.Compress,                    // compress rotated files
+			}), nil
+		}
+
+		// Standard file without rotation
 		file, err := os.OpenFile(
 			outputPath,
 			os.O_APPEND|os.O_CREATE|os.O_WRONLY,
@@ -165,6 +282,13 @@ func getWriter(outputPath string) (zapcore.WriteSyncer, error) {
 		}
 		return zapcore.AddSync(file), nil
 	}
+}
+
+func getOrDefault(value, defaultValue int) int {
+	if value == 0 {
+		return defaultValue
+	}
+	return value
 }
 
 // Wrapper to load config dari ENV + create logger
@@ -216,4 +340,38 @@ func WithRequestID(logger *zap.Logger, requestID string) *zap.Logger {
 // WithFields adds custom fields to logger
 func WithFields(logger *zap.Logger, fields ...zap.Field) *zap.Logger {
 	return logger.With(fields...)
+}
+
+// LogError logs an error and returns it (useful for error handling)
+func LogError(logger *zap.Logger, msg string, err error, fields ...zap.Field) error {
+	if err == nil {
+		return nil
+	}
+	allFields := append(fields, zap.Error(err))
+	logger.Error(msg, allFields...)
+	return err
+}
+
+// LogErrorAndExit logs an error and exits with status code 1
+func LogErrorAndExit(logger *zap.Logger, msg string, err error, fields ...zap.Field) {
+	if err != nil {
+		allFields := append(fields, zap.Error(err))
+		logger.Fatal(msg, allFields...)
+	}
+}
+
+// Must panics if error is not nil (useful for initialization)
+func Must(logger *zap.Logger, err error) {
+	if err != nil {
+		logger.Fatal("Fatal error", zap.Error(err))
+	}
+}
+
+// MustLogger creates a logger or panics (useful for init)
+func MustLogger(cfg Config) *zap.Logger {
+	logger, err := New(cfg)
+	if err != nil {
+		panic(fmt.Sprintf("failed to create logger: %v", err))
+	}
+	return logger
 }

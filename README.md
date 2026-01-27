@@ -12,6 +12,10 @@ A simple and configurable structured logging library for Go, built on top of [ub
 - Automatic caller information and stack traces
 - **Persistent metadata fields** (service name, environment, version, host, PID)
 - **Request/Trace ID** support for distributed tracing
+- **Global logger instance** - no need to pass logger everywhere
+- **Log rotation** - automatic file rotation based on size/date
+- **Multiple outputs** - log to console and file simultaneously
+- **Error handling helpers** - simplified error logging patterns
 - Production-ready structured logging
 
 ## Installation
@@ -22,7 +26,36 @@ go get github.com/andinianst93/logger
 
 ## Quick Start
 
-### Basic Usage
+### Using Global Logger (Simplest)
+
+```go
+package main
+
+import (
+    "github.com/andinianst93/logger"
+    "go.uber.org/zap"
+)
+
+func main() {
+    // Initialize global logger once at startup
+    log := logger.MustLogger(logger.Config{
+        Level:       "info",
+        Format:      "json",
+        ServiceName: "my-service",
+        Environment: "production",
+    })
+    logger.SetGlobalLogger(log)
+    defer logger.Sync()
+
+    // Use global logger anywhere in your code
+    logger.Info("Application started")
+    logger.Debug("This won't show because level is 'info'")
+    logger.Warn("Warning message")
+    logger.Error("Error occurred", zap.String("reason", "timeout"))
+}
+```
+
+### Basic Usage (with logger instance)
 
 ```go
 package main
@@ -111,6 +144,21 @@ You can add persistent metadata fields that will appear in every log entry:
 
 ## Helper Functions
 
+### Global Logger Functions
+
+```go
+// Set global logger at startup
+logger.SetGlobalLogger(myLogger)
+
+// Use anywhere without passing logger instance
+logger.Info("Hello")
+logger.Error("Error", zap.Error(err))
+
+// Or get the instance
+log := logger.L() // shorthand
+log := logger.GetGlobalLogger()
+```
+
 ### WithTraceID / WithRequestID
 
 Add trace/request ID to logger for distributed tracing:
@@ -140,6 +188,76 @@ userLog.Info("Processing user action")
 ```
 
 ## Examples
+
+### Log Rotation (Production)
+
+```go
+log, _ := logger.New(logger.Config{
+    Level:       "info",
+    Format:      "json",
+    OutputPath:  "/var/log/app.log",
+    ServiceName: "api-service",
+    Environment: "production",
+    
+    // Enable log rotation
+    Rotation: &logger.RotationConfig{
+        Filename:   "/var/log/app.log",
+        MaxSize:    100,  // 100 MB per file
+        MaxBackups: 7,    // Keep 7 old files
+        MaxAge:     30,   // Keep for 30 days
+        Compress:   true, // Compress old files
+    },
+})
+```
+
+### Multiple Outputs (Console + File)
+
+```go
+log, _ := logger.New(logger.Config{
+    Level:       "debug",
+    Format:      "json",
+    OutputPath:  "/var/log/app.log",    // Primary output
+    AdditionalOuts: []string{"stdout"}, // Also log to console
+    ServiceName: "worker-service",
+})
+
+log.Info("This will appear in both file and console")
+```
+
+### Error Handling Helpers
+
+```go
+import (
+    "errors"
+    "github.com/andinianst93/logger"
+    "go.uber.org/zap"
+)
+
+func processData() error {
+    log := logger.L() // Get global logger
+    
+    data, err := fetchData()
+    if err != nil {
+        // Log and return error
+        return logger.LogError(log, "Failed to fetch data", err,
+            zap.String("source", "database"),
+        )
+    }
+    
+    // Must: panic if error
+    logger.Must(log, validateData(data))
+    
+    return nil
+}
+
+// Or use in main for fatal errors
+func main() {
+    log := logger.MustLogger(logger.Config{...})
+    
+    err := startServer()
+    logger.LogErrorAndExit(log, "Server failed to start", err)
+}
+```
 
 ### Production Logger with Metadata
 
